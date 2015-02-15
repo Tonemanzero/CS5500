@@ -1,6 +1,8 @@
 #include <iostream>
+#include <mutex>
+#include <tbb/tbb.h>
+
 #include "PerlinNoise.h"
-#include "tbb/tbb.h"
 
 PerlinNoise::PerlinNoise(uint seed)
 {
@@ -11,7 +13,6 @@ PerlinNoise::PerlinNoise(uint seed)
 
 PerlinNoise::PerlinNoise()
 {
-
   std::random_device rd;
   std::default_random_engine generator(rd());
   initialize(generator);
@@ -75,6 +76,11 @@ double PerlinNoise::knot(int i, int j, int k, vector3d& v) const
 double PerlinNoise::dot(vector3d left, vector3d right) const
 {
   return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
+}
+
+double PerlinNoise::turbulence1D(double x, int depth) const
+{
+  return this->turbulence3D(x, 1.0, 1.0, depth);
 }
 
 double PerlinNoise::turbulence2D(double x, double y, int depth) const
@@ -196,7 +202,6 @@ std::shared_ptr<matrix2d> PerlinNoise::createMatrix2D(int width,
                                                       int perlinDepth) const
 {
   auto matrix = std::make_shared<matrix2d>(width, std::vector<double>(height));
-  std::default_random_engine generator;
   std::uniform_real_distribution<double> distribution(-1.0, 1.0);
 
   tbb::parallel_for(tbb::blocked_range<int>(0, width),
@@ -211,6 +216,41 @@ std::shared_ptr<matrix2d> PerlinNoise::createMatrix2D(int width,
           setOneCell2D(this, matrix, i, j, width, height, perlinDepth);
 
       });
+    }
+  });
+
+  return matrix;
+}
+
+std::mutex matrixMutex1D;
+void setOneCell1D(const PerlinNoise* perlin,
+                  std::shared_ptr<matrix1d> matrix,
+                  int i,
+                  int width,
+                  int perlinDepth)
+{
+  double x = (double)i / (double)width;
+  x = (x * 2) - 1.0;
+
+  double noise = perlin->turbulence1D(x, perlinDepth);
+  {
+    std::lock_guard<std::mutex> locker(matrixMutex1D);
+    (*matrix)[i] = noise;
+  }
+}
+
+std::shared_ptr<matrix1d> PerlinNoise::createMatrix1D(int width,
+                                                      int perlinDepth) const
+{
+  auto matrix = std::make_shared<matrix1d>(width);
+  std::uniform_real_distribution<double> distribution(-1.0, 1.0);
+
+  tbb::parallel_for(tbb::blocked_range<int>(0, width),
+                    [=](const tbb::blocked_range<int>& ri)
+                    {
+    for (int i = ri.begin(); i != ri.end(); i++)
+    {
+      setOneCell1D(this, matrix, i, width, perlinDepth);
     }
   });
 
@@ -259,4 +299,41 @@ double PerlinNoise::noise(const vector3d& p) const
   sum += knot(fi + 1, fj + 1, fk + 1, v);
 
   return sum;
+}
+
+// average heights of neighboring points
+void PerlinNoise::smooth(std::shared_ptr<matrix2d> noiseMap)
+{
+  auto wrap_under = [](int index, int max)
+  {
+    return index == 0 ? max - 1 : index - 1;
+  };
+  auto wrap_over = [](int index, int max)
+  {
+    return index == max - 1 ? 0 : index + 1;
+  };
+
+  int width = noiseMap->size();
+  int height = noiseMap->at(0).size();
+  for (int i = 0; i < width; i++)
+  {
+    for (int j = 0; j < height; j++)
+    {
+      double new_height = 0.0;
+      new_height += noiseMap->at(i)[j] / 4;
+      new_height += noiseMap->at(wrap_under(i, width))[j] / 8;
+      new_height += noiseMap->at(wrap_over(i, width))[j] / 8;
+      new_height += noiseMap->at(i)[wrap_under(j, height)] / 8;
+      new_height += noiseMap->at(i)[wrap_over(j, height)] / 8;
+      new_height +=
+        noiseMap->at(wrap_under(i, width))[wrap_under(j, height)] / 16;
+      new_height +=
+        noiseMap->at(wrap_under(i, width))[wrap_over(j, height)] / 16;
+      new_height +=
+        noiseMap->at(wrap_over(i, width))[wrap_under(j, height)] / 16;
+      new_height +=
+        noiseMap->at(wrap_over(i, width))[wrap_over(j, height)] / 16;
+      noiseMap->at(i)[j] = new_height;
+    }
+  }
 }
